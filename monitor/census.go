@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,7 @@ type (
 		kProfile                      tag.Key
 		kProfiles                     tag.Key
 		kErrorCode                    tag.Key
+		kTry                          tag.Key
 		mSegmentSourceAppeared        *stats.Int64Measure
 		mSegmentEmerged               *stats.Int64Measure
 		mSegmentEmergedWithProfiles   *stats.Int64Measure
@@ -73,6 +75,7 @@ type (
 		mMaxSessions                  *stats.Int64Measure
 		mCurrentSessions              *stats.Int64Measure
 		mDiscoveryError               *stats.Int64Measure
+		mTranscodeRetried             *stats.Int64Measure
 		mSuccessRate                  *stats.Float64Measure
 		mTranscodeTime                *stats.Float64Measure
 		mTranscodeLatency             *stats.Float64Measure
@@ -91,12 +94,18 @@ type (
 		failed      bool
 	}
 
+	tryData struct {
+		first time.Time
+		tries int
+	}
+
 	segmentsAverager struct {
 		segments  []segmentCount
 		start     int
 		end       int
 		removed   bool
 		removedAt time.Time
+		tries     map[uint64]tryData // seqNo:try
 	}
 )
 
@@ -121,6 +130,7 @@ func initCensus(nodeType, nodeID, version string) {
 	census.kProfile, _ = tag.NewKey("profile")
 	census.kProfiles, _ = tag.NewKey("profiles")
 	census.kErrorCode, _ = tag.NewKey("error_code")
+	census.kTry, _ = tag.NewKey("try")
 	census.ctx, err = tag.New(context.Background(), tag.Insert(census.kNodeType, nodeType), tag.Insert(census.kNodeID, nodeID))
 	if err != nil {
 		glog.Fatal("Error creating context", err)
@@ -142,6 +152,7 @@ func initCensus(nodeType, nodeID, version string) {
 	census.mMaxSessions = stats.Int64("max_sessions_total", "MaxSessions", "tot")
 	census.mCurrentSessions = stats.Int64("current_sessions_total", "Number of currently transcded streams", "tot")
 	census.mDiscoveryError = stats.Int64("discovery_errors_total", "Number of discover errors", "tot")
+	census.mTranscodeRetried = stats.Int64("transcode_retried", "Number of times segment transcode was retried", "tot")
 	census.mSuccessRate = stats.Float64("success_rate", "Success rate", "per")
 	census.mTranscodeTime = stats.Float64("transcode_time_seconds", "Transcoding time", "sec")
 	census.mTranscodeLatency = stats.Float64("transcode_latency_seconds",
@@ -328,6 +339,13 @@ func initCensus(nodeType, nodeID, version string) {
 			TagKeys:     append([]tag.Key{census.kErrorCode}, baseTags...),
 			Aggregation: view.Count(),
 		},
+		&view.View{
+			Name:        "transcode_retried",
+			Measure:     census.mTranscodeRetried,
+			Description: "Number of times segment transcode was retried",
+			TagKeys:     append([]tag.Key{census.kTry}, baseTags...),
+			Aggregation: view.Count(),
+		},
 	}
 	// Register the views
 	if err := view.Register(views...); err != nil {
@@ -510,6 +528,12 @@ func (cen *censusMetricsCounter) timeoutWatcher(ctx context.Context) {
 				// need to keep this around for some time to give Prometheus chance to scrape this value
 				// (Prometheus scrapes every 5 seconds)
 				delete(cen.success, nonce)
+			} else {
+				for seqNo, tr := range avg.tries {
+					if now.Sub(tr.first) > 2*timeToWaitForError {
+						delete(avg.tries, seqNo)
+					}
+				}
 			}
 		}
 		cen.lock.Unlock()
@@ -527,6 +551,35 @@ func CurrentSessions(currentSessions int) {
 	census.lock.Lock()
 	defer census.lock.Unlock()
 	stats.Record(census.ctx, census.mCurrentSessions.M(int64(currentSessions)))
+}
+
+func TranscodeTry(nonce, seqNo uint64) {
+	census.lock.Lock()
+	defer census.lock.Unlock()
+	if av, ok := census.success[nonce]; ok {
+		if av.tries == nil {
+			av.tries = make(map[uint64]tryData)
+		}
+		try := 1
+		if ts, tok := av.tries[seqNo]; tok {
+			ts.tries++
+			try = ts.tries
+			av.tries[seqNo] = ts
+			label := ">10"
+			if ts.tries < 11 {
+				label = strconv.Itoa(ts.tries)
+			}
+			ctx, err := tag.New(census.ctx, tag.Insert(census.kTry, label))
+			if err != nil {
+				glog.Error("Error creating context", err)
+				return
+			}
+			stats.Record(ctx, census.mTranscodeRetried.M(1))
+		} else {
+			av.tries[seqNo] = tryData{tries: 1, first: time.Now()}
+		}
+		glog.Infof("Trying to transcode segment nonce=%d seqNo=%d try=%d", nonce, seqNo, try)
+	}
 }
 
 func (cen *censusMetricsCounter) segmentEmerged(nonce, seqNo uint64, profilesNum int) {
@@ -558,10 +611,12 @@ func (cen *censusMetricsCounter) segmentUploaded(nonce, seqNo uint64, uploadDur 
 	stats.Record(cen.ctx, cen.mSegmentUploaded.M(1), cen.mUploadTime.M(float64(uploadDur/time.Second)))
 }
 
-func (cen *censusMetricsCounter) segmentUploadFailed(nonce, seqNo uint64, code SegmentUploadError) {
+func (cen *censusMetricsCounter) segmentUploadFailed(nonce, seqNo uint64, code SegmentUploadError, permanent bool) {
 	cen.lock.Lock()
 	defer cen.lock.Unlock()
-	cen.countSegmentEmerged(nonce, seqNo)
+	if permanent {
+		cen.countSegmentEmerged(nonce, seqNo)
+	}
 
 	ctx, err := tag.New(cen.ctx, tag.Insert(census.kErrorCode, string(code)))
 	if err != nil {
@@ -569,8 +624,10 @@ func (cen *censusMetricsCounter) segmentUploadFailed(nonce, seqNo uint64, code S
 		return
 	}
 	stats.Record(ctx, cen.mSegmentUploadFailed.M(1))
-	cen.countSegmentTranscoded(nonce, seqNo, true)
-	cen.sendSuccess()
+	if permanent {
+		cen.countSegmentTranscoded(nonce, seqNo, true)
+		cen.sendSuccess()
+	}
 }
 
 func (cen *censusMetricsCounter) segmentTranscoded(nonce, seqNo uint64, transcodeDur, totalDur time.Duration,
@@ -585,7 +642,7 @@ func (cen *censusMetricsCounter) segmentTranscoded(nonce, seqNo uint64, transcod
 	stats.Record(ctx, cen.mSegmentTranscoded.M(1), cen.mTranscodeTime.M(float64(transcodeDur/time.Second)))
 }
 
-func (cen *censusMetricsCounter) segmentTranscodeFailed(nonce, seqNo uint64, code SegmentTranscodeError) {
+func (cen *censusMetricsCounter) segmentTranscodeFailed(nonce, seqNo uint64, code SegmentTranscodeError, permanent bool) {
 	cen.lock.Lock()
 	defer cen.lock.Unlock()
 	ctx, err := tag.New(cen.ctx, tag.Insert(census.kErrorCode, string(code)))
@@ -594,9 +651,11 @@ func (cen *censusMetricsCounter) segmentTranscodeFailed(nonce, seqNo uint64, cod
 		return
 	}
 	stats.Record(ctx, cen.mSegmentTranscodeFailed.M(1))
-	cen.countSegmentEmerged(nonce, seqNo)
-	cen.countSegmentTranscoded(nonce, seqNo, code != SegmentTranscodeErrorSessionEnded)
-	cen.sendSuccess()
+	if permanent {
+		cen.countSegmentEmerged(nonce, seqNo)
+		cen.countSegmentTranscoded(nonce, seqNo, code != SegmentTranscodeErrorSessionEnded)
+		cen.sendSuccess()
+	}
 }
 
 func (cen *censusMetricsCounter) countSegmentTranscoded(nonce, seqNo uint64, failed bool) {
