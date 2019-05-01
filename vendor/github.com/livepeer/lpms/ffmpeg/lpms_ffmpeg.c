@@ -6,6 +6,9 @@
 #include <libavfilter/buffersrc.h>
 #include <libavutil/opt.h>
 
+// Not great to appropriate internal API like this...
+const int lpms_INPUT_PIXFMT = FFERRTAG('I','N','P','X');
+
 //
 // Internal transcoder data structures
 //
@@ -14,6 +17,9 @@ struct input_ctx {
   AVCodecContext  *vc; // video decoder optional
   AVCodecContext  *ac; // audo  decoder optional
   int vi, ai; // video and audio stream indices
+
+  // Hardware decoding support
+  AVBufferRef *hw_device_ctx;
 };
 
 struct filter_ctx {
@@ -26,6 +32,8 @@ struct filter_ctx {
 
 struct output_ctx {
   char *fname;         // required output file name
+  char *vencoder;      // required output video encoder
+  char *vfilters;      // required output video filters
   int width, height, bitrate; // w, h, br required
   AVRational fps;
   AVFormatContext *oc; // muxer required
@@ -168,6 +176,29 @@ static void free_output(struct output_ctx *octx)
   free_filter(&octx->af);
 }
 
+static enum AVPixelFormat hw2pixfmt(AVCodecContext *ctx)
+{
+  const AVCodec *decoder = ctx->codec;
+  input_params *params = (input_params*)ctx->opaque;
+  for (int i = 0;; i++) {
+    const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
+    if (!config) {
+      fprintf(stderr, "Decoder %s does not support hw decoding\n", decoder->name);
+      return AV_PIX_FMT_NONE;
+    }
+    if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+        config->device_type == params->hw_type) {
+      return  config->pix_fmt;
+    }
+  }
+  return AV_PIX_FMT_NONE;
+}
+
+static enum AVPixelFormat get_hw_pixfmt(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts)
+{
+  // XXX see avcodec_get_hw_frames_parameters if fmt changes mid-stream
+  return hw2pixfmt(ctx);
+}
 
 static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
 {
@@ -192,19 +223,23 @@ static int open_output(struct output_ctx *octx, struct input_ctx *ictx)
   octx->oc = oc;
 
   if (ictx->vc) {
-    codec = avcodec_find_encoder_by_name("libx264"); // XXX make more flexible?
-    if (!codec) em_err("Unable to find libx264");
+    codec = avcodec_find_encoder_by_name(octx->vencoder);
+    if (!codec) em_err("Unable to find encoder");
 
     // open video encoder
     // XXX use avoptions rather than manual enumeration
     vc = avcodec_alloc_context3(codec);
-    if (!vc) em_err("Unable to alloc video encoder\n"); // XXX shld be optional
+    if (!vc) em_err("Unable to alloc video encoder\n");
     octx->vc = vc;
     vc->width = av_buffersink_get_w(octx->vf.sink_ctx);
     vc->height = av_buffersink_get_h(octx->vf.sink_ctx);
     if (octx->fps.den) vc->framerate = av_buffersink_get_frame_rate(octx->vf.sink_ctx);
     if (octx->fps.den) vc->time_base = av_buffersink_get_time_base(octx->vf.sink_ctx);
     if (octx->bitrate) vc->rc_min_rate = vc->rc_max_rate = vc->rc_buffer_size = octx->bitrate;
+    if (av_buffersink_get_hw_frames_ctx(octx->vf.sink_ctx)) {
+      vc->hw_frames_ctx =
+        av_buffer_ref(av_buffersink_get_hw_frames_ctx(octx->vf.sink_ctx));
+    }
     vc->pix_fmt = av_buffersink_get_format(octx->vf.sink_ctx); // XXX select based on encoder + input support
     if (fmt->flags & AVFMT_GLOBALHEADER) vc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     /*
@@ -277,9 +312,10 @@ static void free_input(struct input_ctx *inctx)
   if (inctx->ic) avformat_close_input(&inctx->ic);
   if (inctx->vc) avcodec_free_context(&inctx->vc);
   if (inctx->ac) avcodec_free_context(&inctx->ac);
+  if (inctx->hw_device_ctx) av_buffer_unref(&inctx->hw_device_ctx);
 }
 
-static int open_input(char *inp, struct input_ctx *ctx)
+static int open_input(input_params *params, struct input_ctx *ctx)
 {
 #define dd_err(msg) { \
   if (!ret) ret = -1; \
@@ -288,6 +324,7 @@ static int open_input(char *inp, struct input_ctx *ctx)
 }
   AVCodec *codec = NULL;
   AVFormatContext *ic   = NULL;
+  char *inp = params->fname;
 
   // open demuxer
   int ret = avformat_open_input(&ic, inp, NULL, NULL);
@@ -306,6 +343,29 @@ static int open_input(char *inp, struct input_ctx *ctx)
     ctx->vc = vc;
     ret = avcodec_parameters_to_context(vc, ic->streams[ctx->vi]->codecpar);
     if (ret < 0) dd_err("Unable to assign video params\n");
+    if (params->hw_type != AV_HWDEVICE_TYPE_NONE) {
+      // First set the hw device then set the hw frame
+      AVHWFramesContext *frames;
+      ret = av_hwdevice_ctx_create(&ctx->hw_device_ctx, params->hw_type, params->device, NULL, 0);
+      if (ret < 0) dd_err("Unable to open hardware context for decoding")
+      vc->hw_device_ctx = av_buffer_ref(ctx->hw_device_ctx);
+      vc->get_format = get_hw_pixfmt;
+      vc->opaque = (void*)params;
+      // XXX Ideally this would be auto initialized by the HW device ctx
+      //     However the initialization doesn't occur in time to set up filters
+      //     So we do it here. Also see avcodec_get_hw_frames_parameters
+      vc->hw_frames_ctx = av_hwframe_ctx_alloc(vc->hw_device_ctx);
+      if (!vc->hw_frames_ctx) dd_err("Unable to allocate hwframe context for decoding")
+      frames = (AVHWFramesContext*)vc->hw_frames_ctx->data;
+      frames->format = hw2pixfmt(vc);
+      frames->sw_format = vc->pix_fmt;
+      frames->width = vc->width;
+      frames->height = vc->height;
+      vc->extra_hw_frames = 16 + 1; // H.264 max refs but increases mem usage
+      ret = av_hwframe_ctx_init(vc->hw_frames_ctx);
+      if (AVERROR(ENOSYS) == ret) ret = lpms_INPUT_PIXFMT; // most likely
+      if (ret < 0) dd_err("Unable to initialize a hardware frame pool")
+    }
     ret = avcodec_open2(vc, codec, NULL);
     if (ret < 0) dd_err("Unable to open video decoder\n");
   }
@@ -332,8 +392,7 @@ open_input_err:
 #undef dd_err
 }
 
-static int init_video_filters(struct input_ctx *ictx, struct output_ctx *octx,
-    const char *filters_descr)
+static int init_video_filters(struct input_ctx *ictx, struct output_ctx *octx)
 {
 #define filters_err(msg) { \
   if (!ret) ret = -1; \
@@ -347,25 +406,35 @@ static int init_video_filters(struct input_ctx *ictx, struct output_ctx *octx,
     AVFilterInOut *outputs = avfilter_inout_alloc();
     AVFilterInOut *inputs  = avfilter_inout_alloc();
     AVRational time_base = ictx->ic->streams[ictx->vi]->time_base;
-    enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE }; // XXX ensure the encoder allows this
+    enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_CUDA, AV_PIX_FMT_NONE }; // XXX ensure the encoder allows this
     struct filter_ctx *vf = &octx->vf;
+    char *filters_descr = octx->vfilters;
+    enum AVPixelFormat in_pix_fmt = ictx->vc->pix_fmt;
 
     vf->graph = avfilter_graph_alloc();
     if (!outputs || !inputs || !vf->graph) {
       ret = AVERROR(ENOMEM);
       filters_err("Unble to allocate filters\n");
     }
+    if (ictx->vc->hw_device_ctx) in_pix_fmt = hw2pixfmt(ictx->vc);
 
     /* buffer video source: the decoded frames from the decoder will be inserted here. */
     snprintf(args, sizeof args,
             "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-            ictx->vc->width, ictx->vc->height, ictx->vc->pix_fmt,
+            ictx->vc->width, ictx->vc->height, in_pix_fmt,
             time_base.num, time_base.den,
             ictx->vc->sample_aspect_ratio.num, ictx->vc->sample_aspect_ratio.den);
 
     ret = avfilter_graph_create_filter(&vf->src_ctx, buffersrc,
                                        "in", args, NULL, vf->graph);
     if (ret < 0) filters_err("Cannot create video buffer source\n");
+    if (ictx->vc && ictx->vc->hw_frames_ctx) {
+      // XXX a bit problematic in that it's set before decoder is fully ready
+      AVBufferSrcParameters *srcpar = av_buffersrc_parameters_alloc();
+      srcpar->hw_frames_ctx = ictx->vc->hw_frames_ctx;
+      av_buffersrc_parameters_set(vf->src_ctx, srcpar);
+      av_freep(&srcpar);
+    }
 
     /* buffer video sink: to terminate the filter chain. */
     ret = avfilter_graph_create_filter(&vf->sink_ctx, buffersink,
@@ -619,7 +688,7 @@ int process_out(struct output_ctx *octx, AVCodecContext *encoder, AVStream *ost,
   //     hasn't been a problem in practice (so far)
   if (AVMEDIA_TYPE_AUDIO == ost->codecpar->codec_type) {
       if (octx->drop_ts == AV_NOPTS_VALUE) octx->drop_ts = pkt.pts;
-      if (pkt.pts && pkt.pts == octx->drop_ts) return 0;
+      if (pkt.pts && pkt.pts == octx->drop_ts) goto proc_cleanup;
   }
 
   ret = av_interleaved_write_frame(octx->oc, &pkt);
@@ -634,7 +703,7 @@ proc_cleanup:
 
 #define MAX_OUTPUT_SIZE 10
 
-int lpms_transcode(char *inp, output_params *params, int nb_outputs)
+int lpms_transcode(input_params *inp, output_params *params, int nb_outputs)
 {
 #define main_err(msg) { \
   if (!ret) ret = AVERROR(EINVAL); \
@@ -650,6 +719,7 @@ int lpms_transcode(char *inp, output_params *params, int nb_outputs)
   memset(&ictx, 0, sizeof ictx);
   memset(outputs, 0, sizeof outputs);
 
+  if (!inp) main_err("transcoder: Missing input params\n")
   if (nb_outputs > MAX_OUTPUT_SIZE) main_err("transcoder: Too many outputs\n");
 
   // populate input context
@@ -662,13 +732,12 @@ int lpms_transcode(char *inp, output_params *params, int nb_outputs)
     octx->fname = params[i].fname;
     octx->width = params[i].w;
     octx->height = params[i].h;
+    octx->vencoder = params[i].vencoder;
+    octx->vfilters = params[i].vfilters;
     if (params[i].bitrate) octx->bitrate = params[i].bitrate;
     if (params[i].fps.den) octx->fps = params[i].fps;
     if (ictx.vc) {
-      char filter_str[256];
-      // preserve aspect ratio along the larger dimension when rescaling
-      snprintf(filter_str, sizeof filter_str, "fps=fps=%d/%d,scale='w=if(gte(iw,ih),%d,-2):h=if(lt(iw, ih),%d,-2)'", octx->fps.num, octx->fps.den, octx->width, octx->height);
-      ret = init_video_filters(&ictx, octx, filter_str);
+      ret = init_video_filters(&ictx, octx);
       if (ret < 0) main_err("Unable to open video filter");
     }
     if (ictx.ac) {
