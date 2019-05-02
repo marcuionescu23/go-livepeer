@@ -2,14 +2,20 @@ package core
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/livepeer/go-livepeer/common"
 	"github.com/livepeer/go-livepeer/monitor"
 	"github.com/livepeer/lpms/ffmpeg"
 	"github.com/livepeer/lpms/transcoder"
+
+	"github.com/golang/glog"
 )
 
 type Transcoder interface {
@@ -36,6 +42,64 @@ func (lt *LocalTranscoder) Transcode(fname string, profiles []ffmpeg.VideoProfil
 
 func NewLocalTranscoder(workDir string) Transcoder {
 	return &LocalTranscoder{workDir: workDir}
+}
+
+type NvidiaTranscoder struct {
+	workDir string
+	devices []string
+
+	// The following fields need to be protected by the mutex `mu`
+	mu     *sync.Mutex
+	curDev int
+}
+
+func (nv *NvidiaTranscoder) getDevice() string {
+	nv.mu.Lock()
+	defer nv.mu.Unlock()
+	nv.curDev = (nv.curDev + 1) % len(nv.devices)
+	return nv.devices[nv.curDev]
+}
+
+func (nv *NvidiaTranscoder) Transcode(fname string, profiles []ffmpeg.VideoProfile) ([][]byte, error) {
+	// Set up in / out config
+	in := &ffmpeg.TranscodeOptionsIn{
+		Fname:  fname,
+		Accel:  ffmpeg.Nvidia,
+		Device: nv.getDevice(),
+	}
+	opts := make([]ffmpeg.TranscodeOptions, len(profiles), len(profiles))
+	for i := range profiles {
+		o := ffmpeg.TranscodeOptions{
+			Oname:   fmt.Sprintf("%s/out_%s_%d.%s", nv.workDir, RandomManifestID(), i, filepath.Base(fname)),
+			Profile: profiles[i],
+			Accel:   ffmpeg.Nvidia,
+		}
+		opts[i] = o
+	}
+
+	// Do the Transcoding
+	if err := ffmpeg.Transcode2(in, opts); err != nil {
+		return [][]byte{}, err
+	}
+
+	// Convert results into in-memory bytes following the expected API
+	out := make([][]byte, len(opts), len(opts))
+	for i := range opts {
+		oname := opts[i].Oname
+		o, err := ioutil.ReadFile(oname)
+		if err != nil {
+			glog.Error("Cannot read transcoded output for ", oname)
+			return [][]byte{}, err
+		}
+		out[i] = o
+		os.Remove(oname)
+	}
+	return out, nil
+}
+
+func NewNvidiaTranscoder(inp string, workDir string) Transcoder {
+	devices := strings.Split(inp, ",")
+	return &NvidiaTranscoder{devices: devices, workDir: workDir, mu: &sync.Mutex{}}
 }
 
 func parseURI(uri string) (string, uint64, error) {
