@@ -1,19 +1,31 @@
 package discovery
 
 import (
+	"context"
+	"log"
 	"math/rand"
+	gnet "net"
 	"net/url"
+	"runtime"
 	"testing"
+	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/livepeer/go-livepeer/common"
 	"github.com/livepeer/go-livepeer/core"
 	"github.com/livepeer/go-livepeer/eth"
 	lpTypes "github.com/livepeer/go-livepeer/eth/types"
+	"github.com/livepeer/go-livepeer/net"
 	"github.com/livepeer/go-livepeer/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/test/bufconn"
 )
+
+const bufSize = 1024 * 1024
+
+var lis *bufconn.Listener
 
 type stubOrchestratorPool struct {
 	uris  []*url.URL
@@ -45,6 +57,57 @@ func StubOrchestrators(addresses []string) []*lpTypes.Transcoder {
 	}
 
 	return orchestrators
+}
+
+type stubOrchestratorServer struct {
+	first bool
+}
+
+func (s *stubOrchestratorServer) GetOrchestrator(context context.Context, req *net.OrchestratorRequest) (*net.OrchestratorInfo, error) {
+	if s.first {
+		time.Sleep(100 * time.Millisecond)
+		s.first = false
+	}
+	return &net.OrchestratorInfo{Transcoder: "transcoderfromtestserver"}, nil
+}
+
+func (s *stubOrchestratorServer) Ping(context context.Context, req *net.PingPong) (*net.PingPong, error) {
+	return nil, nil
+}
+
+func initOrchServer() *bufconn.Listener {
+	lis = bufconn.Listen(bufSize)
+	s := grpc.NewServer()
+	net.RegisterOrchestratorServer(s, &stubOrchestratorServer{first: true})
+	go func() {
+		if err := s.Serve(lis); err != nil {
+			log.Fatalf("Server exited with error: %v", err)
+		}
+	}()
+	return lis
+}
+
+func testDialer(string, time.Duration) (gnet.Conn, error) {
+	return lis.Dial()
+}
+
+func TestDeadLock(t *testing.T) {
+	gmp := runtime.GOMAXPROCS(50)
+	defer runtime.GOMAXPROCS(gmp)
+	initOrchServer()
+	server.TestDialer = testDialer
+
+	addresses := []string{}
+	for i := 0; i < 50; i++ {
+		addresses = append(addresses, "https://127.0.0.1:8936")
+	}
+
+	assert := assert.New(t)
+	pool := NewOrchestratorPool(nil, addresses)
+	infos, err := pool.GetOrchestrators(1)
+	assert.Nil(err, "Should not be error")
+	assert.Len(infos, 1, "Should return one orchestrator")
+	assert.Equal(infos[0].Transcoder, "transcoderfromtestserver")
 }
 
 func TestPoolSize(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	gnet "net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -171,12 +172,20 @@ func GetOrchestratorInfo(ctx context.Context, bcast Broadcaster, orchestratorSer
 	return r, nil
 }
 
+// TestDialer used for connecting to mocked server in unit tests
+var TestDialer func(string, time.Duration) (gnet.Conn, error)
+
 func startOrchestratorClient(uri *url.URL) (net.OrchestratorClient, *grpc.ClientConn, error) {
 	glog.Infof("Connecting RPC to %v", uri)
-	conn, err := grpc.Dial(uri.Host,
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
-		grpc.WithBlock(),
-		grpc.WithTimeout(GRPCConnectTimeout))
+	opts := []grpc.DialOption{grpc.WithBlock(), grpc.WithTimeout(GRPCConnectTimeout)}
+	if TestDialer != nil {
+		opts = append(opts, grpc.WithDialer(TestDialer))
+		opts = append(opts, grpc.WithInsecure())
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	}
+	ctx := context.Background()
+	conn, err := grpc.DialContext(ctx, uri.Host, opts...)
 	if err != nil {
 		glog.Error("Did not connect: ", err)
 		return nil, nil, errors.New("Did not connect: " + err.Error())
