@@ -91,10 +91,10 @@ func TestServeTranscoder(t *testing.T) {
 }
 
 func TestRemoteTranscoder(t *testing.T) {
-	n, _ := NewLivepeerNode(nil, "", nil)
+	m := NewRemoteTranscoderManager()
 	initTranscoder := func() (*RemoteTranscoder, *StubTranscoderServer) {
-		strm := &StubTranscoderServer{node: n}
-		tc := NewRemoteTranscoder(n, strm, 5)
+		strm := &StubTranscoderServer{manager: m}
+		tc := NewRemoteTranscoder(m, strm)
 		return tc, strm
 	}
 
@@ -223,10 +223,8 @@ func TestSelectTranscoder(t *testing.T) {
 */
 
 func TestTranscoderManagerTranscoding(t *testing.T) {
-	n, _ := NewLivepeerNode(nil, "", nil)
 	m := NewRemoteTranscoderManager()
-	s := &StubTranscoderServer{node: n}
-	r := NewRemoteTranscoder(n, s, 5)
+	s := &StubTranscoderServer{manager: m}
 
 	// sanity checks
 	assert := assert.New(t)
@@ -235,7 +233,7 @@ func TestTranscoderManagerTranscoding(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() { m.Manage(r); wg.Done() }()
+	go func() { m.Manage(s, 5); wg.Done() }()
 	time.Sleep(1 * time.Millisecond)
 
 	assert.Len(m.remoteTranscoders, 5) // sanity
@@ -269,7 +267,7 @@ func TestTranscoderManagerTranscoding(t *testing.T) {
 
 	// fatal error should not retry
 	wg.Add(1)
-	go func() { m.Manage(r); wg.Done() }()
+	go func() { m.Manage(s, 5); wg.Done() }()
 	time.Sleep(1 * time.Millisecond)
 
 	assert.Len(m.remoteTranscoders, 5) // sanity check
@@ -287,7 +285,7 @@ func TestTranscoderManagerTranscoding(t *testing.T) {
 }
 
 func TestTaskChan(t *testing.T) {
-	n, _ := NewLivepeerNode(nil, "", nil)
+	n := NewRemoteTranscoderManager()
 	// Sanity check task ID
 	if n.taskCount != 0 {
 		t.Error("Unexpected taskid")
@@ -356,7 +354,7 @@ func TestTaskChan(t *testing.T) {
 }
 
 type StubTranscoderServer struct {
-	node            *LivepeerNode
+	manager         *RemoteTranscoderManager
 	SendError       error
 	TranscodeError  error
 	WithholdResults bool
@@ -367,7 +365,7 @@ type StubTranscoderServer struct {
 func (s *StubTranscoderServer) Send(n *net.NotifySegment) error {
 	res := RemoteTranscoderResult{Segments: [][]byte{[]byte("asdf")}, Err: s.TranscodeError}
 	if !s.WithholdResults {
-		s.node.transcoderResults(n.TaskId, &res)
+		s.manager.transcoderResults(n.TaskId, &res)
 	}
 	return s.SendError
 }
