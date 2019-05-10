@@ -448,6 +448,10 @@ type RemoteTranscoder struct {
 	capacity int
 }
 
+type RemoteTranscoderFatalError struct {
+	error
+}
+
 var RemoteTranscoderTimeout = 8 * time.Second
 
 func (r *RemoteTranscoder) Capacity() int {
@@ -466,7 +470,7 @@ func (rt *RemoteTranscoder) Transcode(fname string, profiles []ffmpeg.VideoProfi
 	if err != nil {
 		glog.Error("Error sending message to remote transcoder ", err)
 		rt.eof <- struct{}{}
-		return [][]byte{}, err
+		return [][]byte{}, RemoteTranscoderFatalError{err}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), RemoteTranscoderTimeout)
 	defer cancel()
@@ -474,12 +478,13 @@ func (rt *RemoteTranscoder) Transcode(fname string, profiles []ffmpeg.VideoProfi
 	case <-ctx.Done():
 		// XXX remove transcoder from streams
 		rt.eof <- struct{}{}
-		return [][]byte{}, fmt.Errorf("Remote transcoder took too long")
+		return [][]byte{}, RemoteTranscoderFatalError{fmt.Errorf("Remote transcoder took too long")}
 	case chanData := <-taskChan:
 		glog.Info("Successfully received results from remote transcoder ", len(chanData.Segments))
 		return chanData.Segments, chanData.Err
 	}
-	return [][]byte{}, fmt.Errorf("Unknown error")
+	rt.eof <- struct{}{}
+	return [][]byte{}, RemoteTranscoderFatalError{fmt.Errorf("Unknown error")}
 }
 
 func NewRemoteTranscoder(n *LivepeerNode, stream net.Transcoder_RegisterTranscoderServer, capacity int) *RemoteTranscoder {
@@ -557,10 +562,10 @@ func (rtm *RemoteTranscoderManager) Transcode(fname string, profiles []ffmpeg.Vi
 		return nil, errors.New("No transcoders available")
 	}
 	res, err := currentTranscoder.Transcode(fname, profiles)
-	if err == nil {
+	_, fatal := err.(RemoteTranscoderFatalError)
+	if !fatal {
 		rtm.completeTranscoders(currentTranscoder)
 	}
-
 	return res, err
 }
 
