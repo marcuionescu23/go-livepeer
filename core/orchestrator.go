@@ -453,12 +453,22 @@ type RemoteTranscoderFatalError struct {
 }
 
 var RemoteTranscoderTimeout = 8 * time.Second
+var ErrRemoteTranscoderTimeout = errors.New("Remote transcoder took too long")
 
 func (r *RemoteTranscoder) Capacity() int {
 	return r.capacity
 }
 
 func (rt *RemoteTranscoder) Transcode(fname string, profiles []ffmpeg.VideoProfile) ([][]byte, error) {
+	signalEof := func(err error) ([][]byte, error) {
+		// select so we don't block indefinitely if there's no listener
+		select {
+		case rt.eof <- struct{}{}:
+		default:
+		}
+		glog.Error("Fatal error with remote transcoder: ", err)
+		return [][]byte{}, RemoteTranscoderFatalError{err}
+	}
 	taskId, taskChan := rt.node.addTaskChan()
 	defer rt.node.removeTaskChan(taskId)
 	msg := &net.NotifySegment{
@@ -468,23 +478,18 @@ func (rt *RemoteTranscoder) Transcode(fname string, profiles []ffmpeg.VideoProfi
 	}
 	err := rt.stream.Send(msg)
 	if err != nil {
-		glog.Error("Error sending message to remote transcoder ", err)
-		rt.eof <- struct{}{}
-		return [][]byte{}, RemoteTranscoderFatalError{err}
+		return signalEof(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), RemoteTranscoderTimeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():
-		// XXX remove transcoder from streams
-		rt.eof <- struct{}{}
-		return [][]byte{}, RemoteTranscoderFatalError{fmt.Errorf("Remote transcoder took too long")}
+		return signalEof(ErrRemoteTranscoderTimeout)
 	case chanData := <-taskChan:
 		glog.Info("Successfully received results from remote transcoder ", len(chanData.Segments))
 		return chanData.Segments, chanData.Err
 	}
-	rt.eof <- struct{}{}
-	return [][]byte{}, RemoteTranscoderFatalError{fmt.Errorf("Unknown error")}
+	return signalEof(fmt.Errorf("Unknown error"))
 }
 
 func NewRemoteTranscoder(n *LivepeerNode, stream net.Transcoder_RegisterTranscoderServer, capacity int) *RemoteTranscoder {
@@ -563,9 +568,15 @@ func (rtm *RemoteTranscoderManager) Transcode(fname string, profiles []ffmpeg.Vi
 	}
 	res, err := currentTranscoder.Transcode(fname, profiles)
 	_, fatal := err.(RemoteTranscoderFatalError)
-	if !fatal {
-		rtm.completeTranscoders(currentTranscoder)
+	if fatal {
+		// Don't retry if we've timed out; broadcaster likely to have moved on
+		// XXX problematic for VOD when we *should* retry
+		if err.(RemoteTranscoderFatalError).error == ErrRemoteTranscoderTimeout {
+			return res, err
+		}
+		return rtm.Transcode(fname, profiles)
 	}
+	rtm.completeTranscoders(currentTranscoder)
 	return res, err
 }
 

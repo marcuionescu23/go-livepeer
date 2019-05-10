@@ -251,14 +251,26 @@ func TestTranscoderManagerTranscoding(t *testing.T) {
 	assert.NotNil(m.liveTranscoders[s])
 	s.TranscodeError = nil
 
-	// fatal error should remove from list
+	// fatal error should retry and remove from list
 	s.SendError = fmt.Errorf("SendError")
+	_, err = m.Transcode("", nil)
+	assert.NotNil(err)
+	assert.Equal(err.Error(), "No transcoders available")
+	assert.Len(m.liveTranscoders, 1)   // XXX ideally zero; cleanup register / unregister / eof semantics?
+	assert.Len(m.remoteTranscoders, 0) // retries drain the list
+	s.SendError = nil
+
+	// fatal error should not retry
+	m.Register(r)
+	assert.Len(m.remoteTranscoders, 5) // sanity check
+	s.WithholdResults = true
+	RemoteTranscoderTimeout = 1 * time.Millisecond
 	_, err = m.Transcode("", nil)
 	_, fatal := err.(RemoteTranscoderFatalError)
 	assert.True(fatal)
-	assert.Equal(err.Error(), "SendError")
-	assert.Len(m.liveTranscoders, 1) // XXX ideally zero; cleanup register / unregister / eof semantics?
-	assert.Len(m.remoteTranscoders, 4)
+	assert.Len(m.remoteTranscoders, 4) // no retries, so don't drain
+	s.WithholdResults = false
+	RemoteTranscoderTimeout = 8 * time.Second
 }
 
 func TestTaskChan(t *testing.T) {
